@@ -1,0 +1,116 @@
+name: Build, Scan, and Update Helm Chart
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Set short SHA variable
+        id: vars
+        run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> $GITHUB_ENV
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: hamelin01/web:${{ env.SHORT_SHA }}
+
+  scan-and-upload:
+    name: Run Trivy Scan and Upload Results
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      matrix:
+        severity: [CRITICAL, HIGH]
+    steps:
+      - name: Set short SHA variable
+        id: vars
+        run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> $GITHUB_ENV
+      - name: Log SHORT_SHA
+        run: echo "SHORT_SHA is ${{ env.SHORT_SHA }}"
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'hamelin01/web:${{ env.SHORT_SHA }}'
+          format: 'sarif'
+          output: 'trivy-results-${{ matrix.severity }}-${{ env.SHORT_SHA }}.sarif'
+          severity: ${{ matrix.severity }}
+          exit-code: '0'
+          ignore-unfixed: false
+          vuln-type: 'os,library'
+
+      - name: Generate HTML report
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'hamelin01/web:${{ env.SHORT_SHA }}'
+          format: template
+          template: '@/contrib/html.tpl'
+          output: 'trivy-results-${{ matrix.severity }}-${{ env.SHORT_SHA }}.html'
+          severity: ${{ matrix.severity }}
+          exit-code: '0'
+          ignore-unfixed: false
+          vuln-type: 'os,library'
+
+      - name: Upload Trivy SARIF results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results-${{ matrix.severity }}-${{ env.SHORT_SHA }}.sarif'
+          category: 'trivy-${{ matrix.severity }}-${{ env.SHORT_SHA }}'
+
+      - name: Upload HTML report
+        uses: actions/upload-artifact@v4
+        with:
+          name: Trivy-Scan-Results-${{ matrix.severity }}-${{ env.SHORT_SHA }}
+          path: trivy-results-${{ matrix.severity }}-${{ env.SHORT_SHA }}.html
+
+  update-helm-tag:
+    name: Update Helm Chart Image Tag
+    runs-on: ubuntu-latest
+    needs: scan-and-upload
+    steps:
+      - name: Set short SHA variable
+        id: vars
+        run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> $GITHUB_ENV
+
+      - name: Check out Helm repo
+        uses: actions/checkout@v4
+        with:
+          repository: nattapongpoo/helm-web-test
+          token: ${{ secrets.HELM_REPO_TOKEN }}
+          path: helm-repo
+          ref: ${{ vars.GITHUB_REF }}
+
+      - name: Log contents of helm-repo directory
+        run: ls -R helm-repo
+
+      - name: Update image tag in values.yaml
+        run: |
+          sed -i "s/tag: .*/tag: \"${{ env.SHORT_SHA }}\"/" helm-repo/web-test/values.yaml
+
+      - name: Commit changes
+        run: |
+          cd helm-repo
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "bump container tag to ${{ env.SHORT_SHA }} [ci skip]"
+          git push origin ${{ vars.GITHUB_REF }}
+        
